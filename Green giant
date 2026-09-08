@@ -1,0 +1,256 @@
+-- Universal Aimbot + ESP for Roblox (Delta compatible)
+-- Toggle GUI: X collapses to a ball, click ball to restore.
+-- Settings panel inside the GUI.
+-- Aimbot locks onto enemy heads, has FOV slider, wall check & team check.
+-- ESP draws boxes around enemies.
+
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+-- Settings
+local Settings = {
+    AimbotEnabled = false,
+    TeamCheck = true,
+    WallCheck = true,
+    ESPEnabled = true,
+    FOV = 150,
+    MaxDistance = 500,        -- studs
+}
+
+-- Draw objects
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Thickness = 1
+FOVCircle.NumSides = 64
+FOVCircle.Radius = Settings.FOV
+FOVCircle.Color = Color3.fromRGB(255, 255, 255)
+FOVCircle.Transparency = 0.6
+FOVCircle.Visible = true
+
+-- Multi-line ESP boxes
+local espLines = {}
+local function ensureEspLines(player)
+    if not espLines[player] then
+        local t = {
+            top = Drawing.new("Line"),
+            bottom = Drawing.new("Line"),
+            left = Drawing.new("Line"),
+            right = Drawing.new("Line"),
+        }
+        for _, line in next, t do
+            line.Thickness = 1
+            line.Color = Color3.fromRGB(255, 255, 255)
+            line.Transparency = 1
+        end
+        espLines[player] = t
+    end
+    return espLines[player]
+end
+
+local function destroyEspLines(player)
+    local t = espLines[player]
+    if t then
+        for _, line in next, t do
+            line:Remove()
+        end
+        espLines[player] = nil
+    end
+end
+
+-- Utility functions
+
+local function IsAlive(player)
+    local char = player.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    return hum and root and hum.Health > 0
+end
+
+local function IsEnemy(player)
+    if player == LocalPlayer then return false end
+    local myTeam = LocalPlayer.Team
+    local theirTeam = player.Team
+    if Settings.TeamCheck and myTeam and theirTeam then
+        if myTeam == theirTeam then return false end
+    end
+    return true
+end
+
+local function IsVisible(char)
+    if not Settings.WallCheck then return true end
+    local head = char:FindFirstChild("Head")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not head or not root then return false end
+
+    local origin = Camera.CFrame.Position
+    local targetPos = head.Position
+    local direction = (targetPos - origin).Unit * (targetPos - origin).Magnitude
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    if LocalPlayer.Character then
+        params.FilterDescendantsInstances = {LocalPlayer.Character}
+    end
+
+    local result = workspace:Raycast(origin, direction, params)
+    if result and result.Instance then
+        if char:IsAncestorOf(result.Instance) then
+            return true
+        else
+            return false
+        end
+    end
+    return true
+end
+
+local function worldToScreen(worldPos)
+    local screenPos, onScreen = Camera:WorldToScreenPoint(worldPos)
+    if not onScreen then return nil end
+    return Vector2.new(screenPos.X, screenPos.Y)
+end
+
+-- Find closest enemy to crosshair
+local function getClosestTarget()
+    local center = Camera.ViewportSize / 2
+    local closestDist = math.huge
+    local closestChar = nil
+    local closestHead = nil
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if IsAlive(player) and IsEnemy(player) then
+            local char = player.Character
+            local head = char:FindFirstChild("Head")
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if head and root then
+                local headWorldPos = head.Position + Vector3.new(0, 0.2, 0) -- slight offset to head center
+                local screen = worldToScreen(headWorldPos)
+                if screen then
+                    local dist = (screen - center).Magnitude
+                    if dist <= Settings.FOV and dist < closestDist then
+                        if (root.Position - Camera.CFrame.Position).Magnitude <= Settings.MaxDistance then
+                            if IsVisible(char) then
+                                closestDist = dist
+                                closestChar = char
+                                closestHead = headWorldPos
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return closestChar, closestHead
+end
+
+-- ESP box update (simple 2D bounding box)
+local function getESPBox(char)
+    local head = char:FindFirstChild("Head")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not head or not root then return nil end
+
+    local topPoint = head.Position + Vector3.new(0, head.Size.Y / 2, 0)
+    local bottomPoint = root.Position - Vector3.new(0, 3.5, 0)
+    local midPoint = root.Position
+
+    local topScreen = worldToScreen(topPoint)
+    local bottomScreen = worldToScreen(bottomPoint)
+    local midScreen = worldToScreen(midPoint)
+    if not topScreen or not bottomScreen or not midScreen then return nil end
+
+    local h = math.abs(topScreen.Y - bottomScreen.Y)
+    local w = h * 0.6
+    local centerX = midScreen.X
+
+    local topLeft = Vector2.new(centerX - w / 2, math.min(topScreen.Y, bottomScreen.Y))
+    local bottomRight = Vector2.new(centerX + w / 2, math.max(topScreen.Y, bottomScreen.Y))
+    return topLeft, bottomRight
+end
+
+local function updateESP()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then
+            destroyEspLines(player)
+            continue
+        end
+
+        if Settings.ESPEnabled and IsAlive(player) and IsEnemy(player) then
+            local char = player.Character
+            local boxStart, boxEnd = getESPBox(char)
+            local lines = ensureEspLines(player)
+            if boxStart and boxEnd then
+                -- top
+                lines.top.From = boxStart
+                lines.top.To = Vector2.new(boxEnd.X, boxStart.Y)
+                lines.top.Visible = true
+                -- bottom
+                lines.bottom.From = Vector2.new(boxStart.X, boxEnd.Y)
+                lines.bottom.To = boxEnd
+                lines.bottom.Visible = true
+                -- left
+                lines.left.From = boxStart
+                lines.left.To = Vector2.new(boxStart.X, boxEnd.Y)
+                lines.left.Visible = true
+                -- right
+                lines.right.From = Vector2.new(boxEnd.X, boxStart.Y)
+                lines.right.To = boxEnd
+                lines.right.Visible = true
+            else
+                for _, line in next, lines do
+                    line.Visible = false
+                end
+            end
+        else
+            destroyEspLines(player)
+        end
+    end
+end
+
+-- GUI System
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "AimbotGUI"
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Main GUI Frame (collapsible)
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 250, 0, 170)
+MainFrame.Position = UDim2.new(0.05, 0, 0.5, -85)
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+MainFrame.BackgroundTransparency = 0.2
+MainFrame.BorderSizePixel = 0
+local mainUICorner = Instance.new("UICorner")
+mainUICorner.CornerRadius = UDim.new(0, 8)
+mainUICorner.Parent = MainFrame
+MainFrame.Parent = ScreenGui
+
+-- Title Bar
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 30)
+Title.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+Title.BackgroundTransparency = 0.3
+Title.Text = "Universal Aimbot"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.TextScaled = true
+Title.Font = Enum.Font.GothamBold
+Title.Parent = MainFrame
+
+-- Settings Row helper (creates a label + toggle button + value holder)
+local function createToggle(name, default)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 25)
+    row.BackgroundTransparency = 1
+    row.Parent = MainFrame
+
+    local label = Instance.new("TextLabel")
+    label.AnchorPoint = Vector2.new(0, 0.5)
+    label.Position = UDim2.new(0, 10, 0.5, 0)
+    label.Size = UDim2.new(0, 120, 0, 20)
+    label.BackgroundTransparency = 1
+    label.Text = name
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.
