@@ -1,0 +1,459 @@
+-- Script taken from https://xenoscripts.com website --
+
+-- LocalScript in StarterPlayerScripts
+-- Educational Purpose: Aim Assist System with Predictive Targeting
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================================
+-- CONFIGURATION
+-- ============================================================
+local Config = {
+    AimAssistEnabled = false,
+    FOV = 100,
+    Smoothing = 0.2,
+    ShowFOVCircle = true,
+    TeamCheck = true,
+
+    -- Prediction Settings
+    PredictionStrength = 0.15,   -- How far ahead to predict (seconds)
+    PredictionEnabled = true,    -- Toggle prediction on/off
+    UseHeadOrTorso = "Head",     -- "Head" or "HumanoidRootPart"
+
+    -- FOV Range Limits
+    FOVMin = 50,
+    FOVMax = 300,
+
+    -- Smoothing Range Limits
+    SmoothMin = 0.05,
+    SmoothMax = 1.0,
+}
+
+-- ============================================================
+-- VELOCITY TRACKING (For Prediction)
+-- ============================================================
+local PlayerVelocityData = {}
+-- Stores { lastPosition, lastTime, smoothedVelocity }
+
+local function getSmoothedVelocity(player)
+    local character = player.Character
+    if not character then return Vector3.zero end
+
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return Vector3.zero end
+
+    local now = tick()
+    local data = PlayerVelocityData[player]
+
+    if not data then
+        PlayerVelocityData[player] = {
+            lastPosition   = rootPart.Position,
+            lastTime       = now,
+            smoothedVelocity = Vector3.zero,
+        }
+        return Vector3.zero
+    end
+
+    local deltaTime = now - data.lastTime
+    if deltaTime <= 0 then return data.smoothedVelocity end
+
+    -- Raw velocity from position delta
+    local rawVelocity = (rootPart.Position - data.lastPosition) / deltaTime
+
+    -- Exponential moving average to smooth velocity spikes
+    local alpha = math.clamp(deltaTime * 10, 0, 1) -- Smoothing factor
+    data.smoothedVelocity = data.smoothedVelocity:Lerp(rawVelocity, alpha)
+    data.lastPosition = rootPart.Position
+    data.lastTime = now
+
+    return data.smoothedVelocity
+end
+
+-- Clean up velocity data when players leave
+Players.PlayerRemoving:Connect(function(player)
+    PlayerVelocityData[player] = nil
+end)
+
+-- ============================================================
+-- PREDICTION FUNCTION
+-- ============================================================
+local function getPredictedPosition(player, targetPart)
+    if not Config.PredictionEnabled then
+        return targetPart.Position
+    end
+
+    local velocity = getSmoothedVelocity(player)
+
+    -- Factor in camera distance for prediction scaling
+    local distanceToTarget = (targetPart.Position - Camera.CFrame.Position).Magnitude
+    local travelTime = Config.PredictionStrength * (distanceToTarget / 100)
+
+    -- Clamp travel time to avoid over-prediction at extreme distances
+    travelTime = math.clamp(travelTime, 0, 0.5)
+
+    return targetPart.Position + (velocity * travelTime)
+end
+
+-- ============================================================
+-- TARGET VALIDATION
+-- ============================================================
+local function isValidTarget(player)
+    if not player or player == LocalPlayer then return false end
+
+    local character = player.Character
+    if not character then return false end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return false end
+
+    -- Team check
+    if Config.TeamCheck and LocalPlayer.Team ~= nil
+        and player.Team == LocalPlayer.Team then
+        return false
+    end
+
+    return true
+end
+
+-- ============================================================
+-- FIND CLOSEST TARGET TO CURSOR
+-- ============================================================
+local function getClosestPlayerToCursor()
+    local closestPlayer = nil
+    local closestPart   = nil
+    local shortestDist  = Config.FOV
+
+    local mousePos = UserInputService:GetMouseLocation()
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isValidTarget(player) then
+            local character = player.Character
+            local targetPart = character:FindFirstChild(Config.UseHeadOrTorso)
+
+            if targetPart then
+                -- Use predicted position for FOV check
+                local predicted = getPredictedPosition(player, targetPart)
+                local screenPos, onScreen = Camera:WorldToViewportPoint(predicted)
+
+                if onScreen and screenPos.Z > 0 then
+                    local screenVec  = Vector2.new(screenPos.X, screenPos.Y)
+                    local dist       = (screenVec - mousePos).Magnitude
+
+                    if dist < shortestDist then
+                        shortestDist  = dist
+                        closestPlayer = player
+                        closestPart   = targetPart
+                    end
+                end
+            end
+        end
+    end
+
+    return closestPlayer, closestPart
+end
+
+-- ============================================================
+-- FOV CIRCLE (Drawing)
+-- ============================================================
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Thickness    = 2
+FOVCircle.NumSides     = 64
+FOVCircle.Radius       = Config.FOV
+FOVCircle.Filled       = false
+FOVCircle.Visible      = Config.ShowFOVCircle
+FOVCircle.Color        = Color3.fromRGB(255, 255, 255)
+FOVCircle.Transparency = 0.5
+
+-- ============================================================
+-- GUI BUILDER HELPER
+-- ============================================================
+local function makeCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 6)
+    c.Parent = parent
+    return c
+end
+
+local function makeLabel(parent, text, posY, xAlign)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size               = UDim2.new(0.9, 0, 0, 25)
+    lbl.Position           = UDim2.new(0.05, 0, 0, posY)
+    lbl.BackgroundTransparency = 1
+    lbl.Text               = text
+    lbl.TextColor3         = Color3.fromRGB(255, 255, 255)
+    lbl.Font               = Enum.Font.SourceSans
+    lbl.TextSize           = 16
+    lbl.TextXAlignment     = xAlign or Enum.TextXAlignment.Left
+    lbl.Parent             = parent
+    return lbl
+end
+
+local function makeButton(parent, text, posY, color)
+    local btn = Instance.new("TextButton")
+    btn.Size              = UDim2.new(0.9, 0, 0, 33)
+    btn.Position          = UDim2.new(0.05, 0, 0, posY)
+    btn.BackgroundColor3  = color
+    btn.Text              = text
+    btn.TextColor3        = Color3.fromRGB(255, 255, 255)
+    btn.Font              = Enum.Font.SourceSansBold
+    btn.TextSize          = 15
+    btn.AutoButtonColor   = false
+    btn.Parent            = parent
+    makeCorner(btn, 6)
+    return btn
+end
+
+local function makeSlider(parent, posY, initPercent, color)
+    local bg = Instance.new("Frame")
+    bg.Size             = UDim2.new(0.9, 0, 0, 10)
+    bg.Position         = UDim2.new(0.05, 0, 0, posY)
+    bg.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+    bg.Parent           = parent
+    makeCorner(bg, 5)
+
+    local fill = Instance.new("Frame")
+    fill.Size             = UDim2.new(initPercent, 0, 1, 0)
+    fill.BackgroundColor3 = color or Color3.fromRGB(50, 150, 255)
+    fill.Parent           = bg
+    makeCorner(fill, 5)
+
+    -- Knob
+    local knob = Instance.new("Frame")
+    knob.Size             = UDim2.new(0, 14, 0, 14)
+    knob.Position         = UDim2.new(initPercent, -7, 0.5, -7)
+    knob.BackgroundColor3 = Color3.fromRGB(220, 220, 220)
+    knob.Parent           = bg
+    makeCorner(knob, 7)
+
+    return bg, fill, knob
+end
+
+-- ============================================================
+-- BUILD GUI
+-- ============================================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name         = "AimAssistGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent       = LocalPlayer:WaitForChild("PlayerGui")
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name            = "MainFrame"
+MainFrame.Size            = UDim2.new(0, 300, 0, 440)
+MainFrame.Position        = UDim2.new(0.5, -150, 0.5, -220)
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active          = true
+MainFrame.Draggable       = true
+MainFrame.Parent          = ScreenGui
+makeCorner(MainFrame, 10)
+
+-- Title Bar
+local TitleBar = Instance.new("Frame")
+TitleBar.Size             = UDim2.new(1, 0, 0, 40)
+TitleBar.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+TitleBar.BorderSizePixel  = 0
+TitleBar.Parent           = MainFrame
+makeCorner(TitleBar, 10)
+
+local TitleText = Instance.new("TextLabel")
+TitleText.Size             = UDim2.new(1, 0, 1, 0)
+TitleText.BackgroundTransparency = 1
+TitleText.Text             = "🎯 Aim Assist  |  INSERT to toggle"
+TitleText.TextColor3       = Color3.fromRGB(200, 200, 200)
+TitleText.Font             = Enum.Font.SourceSansBold
+TitleText.TextSize         = 15
+TitleText.Parent           = TitleBar
+
+-- Controls
+local EnableBtn = makeButton(MainFrame, "Aim Assist: OFF", 50, Color3.fromRGB(200, 50, 50))
+
+local FOVLabel = makeLabel(MainFrame, "FOV Size: " .. Config.FOV, 96)
+local FOVSliderBG, FOVFill, FOVKnob = makeSlider(
+    MainFrame, 124,
+    (Config.FOV - Config.FOVMin) / (Config.FOVMax - Config.FOVMin),
+    Color3.fromRGB(50, 160, 255)
+)
+
+local SmoothLabel = makeLabel(MainFrame, "Smoothing: " .. Config.Smoothing, 148)
+local SmoothSliderBG, SmoothFill, SmoothKnob = makeSlider(
+    MainFrame, 176,
+    (Config.Smoothing - Config.SmoothMin) / (Config.SmoothMax - Config.SmoothMin),
+    Color3.fromRGB(50, 200, 120)
+)
+
+local PredictLabel = makeLabel(MainFrame, "Prediction: " .. Config.PredictionStrength .. "s", 200)
+local PredictSliderBG, PredictFill, PredictKnob = makeSlider(
+    MainFrame, 228,
+    Config.PredictionStrength / 0.5,  -- Max prediction 0.5s
+    Color3.fromRGB(255, 160, 50)
+)
+
+local TeamBtn      = makeButton(MainFrame, "Team Check: ON",        254, Color3.fromRGB(40, 140, 40))
+local PredictBtn   = makeButton(MainFrame, "Prediction: ON",        296, Color3.fromRGB(40, 140, 40))
+local FOVCircleBtn = makeButton(MainFrame, "FOV Circle: ON",        338, Color3.fromRGB(40, 140, 40))
+local CloseBtn     = makeButton(MainFrame, "Close",                 390, Color3.fromRGB(140, 40, 40))
+
+-- ============================================================
+-- TOGGLE BUTTON HELPER
+-- ============================================================
+local ON_COLOR  = Color3.fromRGB(40, 160, 40)
+local OFF_COLOR = Color3.fromRGB(180, 40, 40)
+
+local function setToggleButton(btn, state, onText, offText)
+    btn.Text            = state and onText or offText
+    btn.BackgroundColor3 = state and ON_COLOR or OFF_COLOR
+end
+
+-- ============================================================
+-- BUTTON CONNECTIONS
+-- ============================================================
+EnableBtn.MouseButton1Click:Connect(function()
+    Config.AimAssistEnabled = not Config.AimAssistEnabled
+    if Config.AimAssistEnabled then
+        EnableBtn.Text             = "Aim Assist: ON"
+        EnableBtn.BackgroundColor3 = ON_COLOR
+    else
+        EnableBtn.Text             = "Aim Assist: OFF"
+        EnableBtn.BackgroundColor3 = OFF_COLOR
+    end
+end)
+
+TeamBtn.MouseButton1Click:Connect(function()
+    Config.TeamCheck = not Config.TeamCheck
+    setToggleButton(TeamBtn, Config.TeamCheck, "Team Check: ON", "Team Check: OFF")
+end)
+
+PredictBtn.MouseButton1Click:Connect(function()
+    Config.PredictionEnabled = not Config.PredictionEnabled
+    setToggleButton(PredictBtn, Config.PredictionEnabled, "Prediction: ON", "Prediction: OFF")
+end)
+
+FOVCircleBtn.MouseButton1Click:Connect(function()
+    Config.ShowFOVCircle = not Config.ShowFOVCircle
+    setToggleButton(FOVCircleBtn, Config.ShowFOVCircle, "FOV Circle: ON", "FOV Circle: OFF")
+end)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+end)
+
+-- ============================================================
+-- GENERIC SLIDER LOGIC
+-- ============================================================
+local function setupSlider(sliderBG, fill, knob, minVal, maxVal, currentVal, onChanged)
+    local dragging = false
+    local initPct  = (currentVal - minVal) / (maxVal - minVal)
+    fill.Size      = UDim2.new(initPct, 0, 1, 0)
+    knob.Position  = UDim2.new(initPct, -7, 0.5, -7)
+
+    sliderBG.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+
+    -- Return update function for RenderStepped
+    return function()
+        if not dragging then return end
+        local mouse  = UserInputService:GetMouseLocation()
+        local rel    = mouse.X - sliderBG.AbsolutePosition.X
+        local pct    = math.clamp(rel / sliderBG.AbsoluteSize.X, 0, 1)
+        local value  = minVal + pct * (maxVal - minVal)
+
+        fill.Size     = UDim2.new(pct, 0, 1, 0)
+        knob.Position = UDim2.new(pct, -7, 0.5, -7)
+
+        onChanged(value, pct)
+    end
+end
+
+-- Wire up sliders
+local updateFOVSlider = setupSlider(
+    FOVSliderBG, FOVFill, FOVKnob,
+    Config.FOVMin, Config.FOVMax, Config.FOV,
+    function(value)
+        Config.FOV       = math.floor(value)
+        FOVCircle.Radius = Config.FOV
+        FOVLabel.Text    = "FOV Size: " .. Config.FOV
+    end
+)
+
+local updateSmoothSlider = setupSlider(
+    SmoothSliderBG, SmoothFill, SmoothKnob,
+    Config.SmoothMin, Config.SmoothMax, Config.Smoothing,
+    function(value)
+        Config.Smoothing = math.floor(value * 100) / 100
+        SmoothLabel.Text = "Smoothing: " .. Config.Smoothing
+    end
+)
+
+local updatePredictSlider = setupSlider(
+    PredictSliderBG, PredictFill, PredictKnob,
+    0, 0.5, Config.PredictionStrength,
+    function(value)
+        Config.PredictionStrength = math.floor(value * 100) / 100
+        PredictLabel.Text = "Prediction: " .. Config.PredictionStrength .. "s"
+    end
+)
+
+-- ============================================================
+-- KEYBOARD TOGGLE
+-- ============================================================
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.Insert then
+        MainFrame.Visible = not MainFrame.Visible
+    end
+end)
+
+-- ============================================================
+-- RENDER LOOP
+-- ============================================================
+RunService.RenderStepped:Connect(function(deltaTime)
+
+    -- Slider updates
+    updateFOVSlider()
+    updateSmoothSlider()
+    updatePredictSlider()
+
+    -- Velocity tracking (update every frame for all players)
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            getSmoothedVelocity(player) -- Updates internal data
+        end
+    end
+
+    -- FOV Circle
+    local mouseLocation = UserInputService:GetMouseLocation()
+    FOVCircle.Position  = mouseLocation
+    FOVCircle.Visible   = Config.ShowFOVCircle
+
+    -- Aim Assist
+    if not Config.AimAssistEnabled then return end
+    if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then return end
+
+    local target, targetPart = getClosestPlayerToCursor()
+    if not target or not targetPart then return end
+
+    -- Get predicted world position
+    local predictedPos  = getPredictedPosition(target, targetPart)
+    local camPos        = Camera.CFrame.Position
+    local direction     = (predictedPos - camPos).Unit
+    local targetCFrame  = CFrame.new(camPos, camPos + direction)
+
+    -- Smooth camera towards predicted target
+    Camera.CFrame = Camera.CFrame:Lerp(targetCFrame, Config.Smoothing)
+end)
+
+print("✅ Aim Assist loaded — Press INSERT to open GUI")
